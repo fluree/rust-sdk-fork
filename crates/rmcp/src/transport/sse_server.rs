@@ -2,10 +2,11 @@ use std::{collections::HashMap, io, net::SocketAddr, sync::Arc, time::Duration};
 
 use axum::{
     Extension, Json, Router,
+    body::Body,
     extract::{NestedPath, Query, State},
-    http::{StatusCode, request::Parts},
+    http::{HeaderValue, StatusCode, request::Parts},
     response::{
-        Response,
+        IntoResponse, Response,
         sse::{Event, KeepAlive, Sse},
     },
     routing::{get, post},
@@ -21,6 +22,26 @@ use crate::{
     service::{RxJsonRpcMessage, TxJsonRpcMessage, serve_directly_with_ct},
     transport::common::server_side_http::{DEFAULT_AUTO_PING_INTERVAL, SessionId, session_id},
 };
+
+// Helper function to create SSE response with custom headers
+fn create_sse_response_with_headers(
+    stream: impl Stream<Item = Result<Event, io::Error>> + Send + 'static,
+    session_id: &SessionId,
+    keep_alive: Option<Duration>,
+) -> Response<Body> {
+    let sse = Sse::new(stream)
+        .keep_alive(KeepAlive::new().interval(keep_alive.unwrap_or(DEFAULT_AUTO_PING_INTERVAL)));
+
+    // Convert Sse to Response with custom headers
+    let mut response = sse.into_response();
+    let headers = response.headers_mut();
+    headers.insert(
+        "x-session-id",
+        HeaderValue::from_str(session_id.as_ref())
+            .unwrap_or_else(|_| HeaderValue::from_static("unknown")),
+    );
+    response
+}
 
 type TxStore =
     Arc<tokio::sync::RwLock<HashMap<SessionId, tokio::sync::mpsc::Sender<ClientJsonRpcMessage>>>>;
@@ -86,7 +107,7 @@ async fn sse_handler(
     State(app): State<App>,
     nested_path: Option<Extension<NestedPath>>,
     parts: Parts,
-) -> Result<Sse<impl Stream<Item = Result<Event, io::Error>>>, Response<String>> {
+) -> Result<Response<axum::body::Body>, Response<String>> {
     let session = session_id();
     tracing::info!(%session, ?parts, "sse connection");
     use tokio_stream::{StreamExt, wrappers::ReceiverStream};
@@ -131,19 +152,22 @@ async fn sse_handler(
         }
     }));
 
+    let session_clone = session.clone();
+
     tokio::spawn(async move {
         // Wait for connection closure
         to_client_tx_clone.closed().await;
 
         // Clean up session
-        let session_id = session.clone();
+        let session_id = session_clone;
         let tx_store = app.txs.clone();
         let mut txs = tx_store.write().await;
         txs.remove(&session_id);
         tracing::debug!(%session_id, "Closed session and cleaned up resources");
     });
 
-    Ok(Sse::new(stream).keep_alive(KeepAlive::new().interval(ping_interval)))
+    let sse = create_sse_response_with_headers(stream, &session, Some(ping_interval));
+    Ok(sse)
 }
 
 pub struct SseServerTransport {
